@@ -20,7 +20,7 @@ const objects = new Map<string, Obj>();
 
 function hashObject(type: ObjType, data: Buffer): string {
   const head = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return createHash('sha1').update(Buffer.concat([head, data])).digest('hex');
+  return createHash('sha1').update(head).update(data).digest('hex');
 }
 function storeObject(type: ObjType, data: Buffer): string {
   const oid = hashObject(type, data);
@@ -45,6 +45,13 @@ function parseTree(data: Buffer): TreeEntry[] {
   }
   return out;
 }
+/** Trees are immutable and content-addressed, so a parsed tree never goes stale. */
+const parsedTrees = new Map<string, TreeEntry[]>();
+function treeEntries(oid: string, data: Buffer): TreeEntry[] {
+  let entries = parsedTrees.get(oid);
+  if (!entries) { entries = parseTree(data); parsedTrees.set(oid, entries); }
+  return entries;
+}
 function buildTreeData(entries: TreeEntry[]): Buffer {
   const sorted = [...entries].sort((a, b) => {
     const an = a.mode === '40000' ? `${a.name}/` : a.name;
@@ -64,7 +71,7 @@ function flattenTree(treeOid: string | null, prefix = '', out = new Map<string, 
   if (!treeOid) return out;
   const obj = getObject(treeOid);
   if (!obj || obj.type !== 'tree') return out;
-  for (const e of parseTree(obj.data)) {
+  for (const e of treeEntries(treeOid, obj.data)) {
     const path = prefix ? `${prefix}/${e.name}` : e.name;
     if (e.mode === '40000') flattenTree(e.oid, path, out);
     else out.set(path, { mode: e.mode, oid: e.oid });
@@ -120,9 +127,16 @@ function makeCommit(tree: string, parents: string[], message: string, ts?: numbe
   const lines = [`tree ${tree}`, ...parents.map((p) => `parent ${p}`), `author ${ident}`, `committer ${ident}`];
   return storeObject('commit', Buffer.from(`${lines.join('\n')}\n\n${message}`, 'utf8'));
 }
+/** Commits are immutable and content-addressed, so a parsed commit never goes stale. */
+const commitInfoCache = new Map<string, CommitInfo>();
 function commitOf(oid: string): CommitInfo | null {
+  const cached = commitInfoCache.get(oid);
+  if (cached) return cached;
   const o = getObject(oid);
-  return o && o.type === 'commit' ? parseCommit(o.data) : null;
+  if (!o || o.type !== 'commit') return null;
+  const info = parseCommit(o.data);
+  commitInfoCache.set(oid, info);
+  return info;
 }
 /** All commits reachable from tips, newest first (BFS by generation, then timestamp desc). */
 function reachableCommits(tips: string[], exclude = new Set<string>()): string[] {
@@ -340,12 +354,13 @@ function labelJson(l: Label): Record<string, unknown> {
   return { id: l.id, name: l.name, color: l.color, description: l.description };
 }
 function issueJson(r: Repo, i: Issue): Record<string, unknown> {
+  const iso = new Date(i.created).toISOString();
   return {
     id: i.id, number: i.number, title: i.title, body: i.body, state: i.state,
     labels: i.labels.map((n) => { const l = r.labels.get(n); return l ? labelJson(l) : { name: n }; }),
     user: { login: VIEWER.login, id: VIEWER.id },
     comments: r.comments.filter((c) => c.issueNumber === i.number).length,
-    created_at: new Date(i.created).toISOString(), updated_at: new Date(i.created).toISOString(),
+    created_at: iso, updated_at: iso,
   };
 }
 function pullJson(r: Repo, i: Issue): Record<string, unknown> {
@@ -360,7 +375,8 @@ function pullJson(r: Repo, i: Issue): Record<string, unknown> {
   };
 }
 function commentJson(c: Comment): Record<string, unknown> {
-  return { id: c.id, body: c.body, user: { login: c.user, id: VIEWER.id }, created_at: new Date(c.created).toISOString(), updated_at: new Date(c.created).toISOString() };
+  const iso = new Date(c.created).toISOString();
+  return { id: c.id, body: c.body, user: { login: c.user, id: VIEWER.id }, created_at: iso, updated_at: iso };
 }
 
 // --- branch / tree helpers over the store
@@ -486,11 +502,12 @@ function repoByDbId(id: number): Repo | undefined {
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
   const text = body === undefined ? '' : `${JSON.stringify(body)}\n`;
+  const buf = text ? Buffer.from(text, 'utf8') : null;
   res.writeHead(status, {
     'content-type': JSON_TYPE, 'x-github-request-id': randomUUID(),
-    ...(text ? { 'content-length': Buffer.byteLength(text) } : {}), ...headers,
+    ...(buf ? { 'content-length': buf.length } : {}), ...headers,
   });
-  res.end(text);
+  res.end(buf ?? '');
 }
 function sendRaw(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': body.length, 'x-github-request-id': randomUUID() });
@@ -1671,12 +1688,12 @@ function treeClosure(rootTree: string | null, into: Set<string>): void {
   const o = getObject(rootTree);
   if (!o || o.type !== 'tree') return;
   into.add(rootTree);
-  for (const e of parseTree(o.data)) {
+  for (const e of treeEntries(rootTree, o.data)) {
     if (e.mode === '40000') treeClosure(e.oid, into);
     else into.add(e.oid);
   }
 }
-function objectsForCommits(commits: string[], exclude: Set<string>): Obj[] {
+function objectsForCommits(commits: string[], exclude: Set<string>): { oid: string; obj: Obj }[] {
   const picked = new Map<string, Obj>();
   const add = (oid: string): void => {
     if (exclude.has(oid) || picked.has(oid)) return;
@@ -1692,7 +1709,23 @@ function objectsForCommits(commits: string[], exclude: Set<string>): Obj[] {
       for (const oid of closure) add(oid);
     }
   }
-  return [...picked.values()];
+  return [...picked.entries()].map(([oid, obj]) => ({ oid, obj }));
+}
+/**
+ * A pack is a pure function of its ordered object list (writePack is deterministic and the
+ * objects are immutable), so identical fetches — e.g. a burst of clones of one tip — reuse
+ * the bytes instead of re-deflating every object. The cache is small and simply cleared
+ * when full; correctness never depends on it.
+ */
+const packCache = new Map<string, Buffer>();
+function packForList(list: { oid: string; obj: Obj }[]): Buffer {
+  const key = list.map((p) => p.oid).join(' ');
+  const hit = packCache.get(key);
+  if (hit) return hit;
+  const pack = writePack(list.map((p) => p.obj));
+  if (packCache.size >= 64) packCache.clear();
+  packCache.set(key, pack);
+  return pack;
 }
 function closureOfCommits(commits: string[]): Set<string> {
   const out = new Set<string>();
@@ -1703,8 +1736,8 @@ function closureOfCommits(commits: string[]): Set<string> {
   }
   return out;
 }
-/** BFS layers from tips: returns commits grouped by depth (1-based). */
-function commitLayers(tips: string[], boundary: Set<string>): Map<string, number> {
+/** BFS layers from tips: returns commits grouped by depth (1-based); maxDepth stops the walk early. */
+function commitLayers(tips: string[], boundary: Set<string>, maxDepth = Infinity): Map<string, number> {
   const depth = new Map<string, number>();
   let frontier = tips.filter((t) => getObject(t)?.type === 'commit');
   let d = 1;
@@ -1713,7 +1746,7 @@ function commitLayers(tips: string[], boundary: Set<string>): Map<string, number
     for (const oid of frontier) {
       if (depth.has(oid)) continue;
       depth.set(oid, d);
-      if (!boundary.has(oid)) {
+      if (!boundary.has(oid) && d < maxDepth) {
         const c = commitOf(oid);
         if (c) next.push(...c.parents);
       }
@@ -1733,7 +1766,7 @@ function planFetch(repo: Repo, wants: string[], haves: string[], clientShallow: 
   let shallow: string[] = [];
   let unshallow: string[] = [];
   if (depth !== undefined) {
-    const layers = commitLayers(wants, new Set());
+    const layers = commitLayers(wants, new Set(), depth);
     commits = [...layers.entries()].filter(([, d]) => d <= depth).map(([oid]) => oid);
     const boundarySet = new Set(commits.filter((oid) => layers.get(oid) === depth && (commitOf(oid)?.parents.length ?? 0) > 0));
     shallow = [...boundarySet];
@@ -1752,18 +1785,18 @@ function planFetch(repo: Repo, wants: string[], haves: string[], clientShallow: 
     commits = [...layers.keys()].filter((oid) => !haveCommits.has(oid) && !notSet.has(oid));
   }
   const packObjs = objectsForCommits(commits, exclude);
-  const inPack = new Set(packObjs.map((o) => hashObject(o.type, o.data)));
+  const inPack = new Set(packObjs.map((p) => p.oid));
   for (const w of wants) {
     let cur = w;
     for (let i = 0; i < 10; i++) {
       const o = getObject(cur);
       if (!o || o.type !== 'tag' || exclude.has(cur) || inPack.has(cur)) break;
-      packObjs.push(o); inPack.add(cur);
+      packObjs.push({ oid: cur, obj: o }); inPack.add(cur);
       cur = derefTag(cur);
       if (cur === w) break;
     }
   }
-  const pack = writePack(packObjs);
+  const pack = packForList(packObjs);
   return { pack, shallow, unshallow };
 }
 function sidebandPackets(pack: Buffer): Buffer[] {
